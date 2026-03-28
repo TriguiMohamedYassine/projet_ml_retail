@@ -1,247 +1,231 @@
-# ==========================================
-# preprocessing.py
-# Retail ML Project
-# ==========================================
+"""
+preprocessing.py - Nettoyage, encodage, normalisation, et split des données
+"""
 
 import pandas as pd
 import numpy as np
-import joblib
-
+from sklearn.preprocessing import StandardScaler, OrdinalEncoder
+from sklearn.impute import KNNImputer, SimpleImputer
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler, OneHotEncoder, OrdinalEncoder
-from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
-from sklearn.impute import SimpleImputer
-from sklearn.base import BaseEstimator, TransformerMixin
+import os
 
+# ─────────────────────────────────────────────
+# 1. NETTOYAGE DES VALEURS ABERRANTES
+# ─────────────────────────────────────────────
 
-# ==========================================
-# 1️⃣ Custom Feature Engineering
-# ==========================================
-
-class FeatureEngineering(BaseEstimator, TransformerMixin):
-    def fit(self, X, y=None):
-        return self
-
-    def transform(self, X):
-        X = X.copy()
-
-        # Monetary per day
-        X["MonetaryPerDay"] = X["MonetaryTotal"] / (X["Recency"] + 1)
-
-        # Average basket value
-        X["AvgBasketValue"] = X["MonetaryTotal"] / X["Frequency"].replace(0, 1)
-
-        # Tenure ratio
-        if "CustomerTenureDays" in X.columns:
-            X["TenureRatio"] = X["Recency"] / X["CustomerTenureDays"].replace(0, 1)
-        elif "CustomerTenure" in X.columns:
-            X["TenureRatio"] = X["Recency"] / X["CustomerTenure"].replace(0, 1)
-
-        # Engagement score: higher frequency and products, lower recency = more engaged
-        X["EngagementScore"] = (X["Frequency"] * X["UniqueProducts"]) / (X["Recency"] + 1)
-
-        # High risk flag based on ChurnRiskCategory
-        if "ChurnRiskCategory" in X.columns:
-            X["IsHighRisk"] = X["ChurnRiskCategory"].isin(["Élevé", "Critique"]).astype(int)
-
-        return X
-
-
-# ==========================================
-# 1️⃣.b Outlier Handler
-# ==========================================
-
-class OutlierHandler(BaseEstimator, TransformerMixin):
-    """Handle outliers in specific columns"""
-    def fit(self, X, y=None):
-        return self
-
-    def transform(self, X):
-        X = X.copy()
-        
-        # Fix SatisfactionScore outliers: -1, 99 are invalid → NaN
-        if "SatisfactionScore" in X.columns:
-            X.loc[X["SatisfactionScore"] < 0, "SatisfactionScore"] = np.nan
-            X.loc[X["SatisfactionScore"] > 10, "SatisfactionScore"] = np.nan
-        
-        return X
-
-
-# ==========================================
-# 2️⃣ Parsing Dates
-# ==========================================
-
-def parse_dates(df):
+def clean_outliers(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Corrige les valeurs aberrantes connues :
+    - SupportTicketsCount : -1 et 999 → NaN
+    - SatisfactionScore   : -1, 0, 99 → NaN
+    - MonetaryTotal       : valeurs très négatives → NaN
+    """
     df = df.copy()
 
-    if "RegistrationDate" in df.columns:
-        df["RegistrationDate"] = pd.to_datetime(
-            df["RegistrationDate"],
-            dayfirst=True,
-            errors="coerce"
-        )
+    # SupportTicketsCount : -1 (manquant codé) et 999 (erreur)
+    df['SupportTicketsCount'] = df['SupportTicketsCount'].replace([-1, 999], np.nan)
 
-        df["RegYear"] = df["RegistrationDate"].dt.year
-        df["RegMonth"] = df["RegistrationDate"].dt.month
-        df["RegDay"] = df["RegistrationDate"].dt.day
-        df["RegWeekday"] = df["RegistrationDate"].dt.weekday
+    # SatisfactionScore : -1 (manquant), 0 (non renseigné), 99 (erreur)
+    df['SatisfactionScore'] = df['SatisfactionScore'].replace([-1, 0, 99], np.nan)
 
-        df.drop(columns=["RegistrationDate"], inplace=True)
+    # MonetaryTotal/MonetaryMin : valeurs négatives = retours, garder mais signaler
+    # On plafonne les extrêmes à -5000 / 15000 selon le cahier des charges
+    df['MonetaryTotal'] = df['MonetaryTotal'].clip(-5000, 15000)
+    df['MonetaryMin']   = df['MonetaryMin'].clip(-5000, 5000)
 
+    print("✅ Valeurs aberrantes corrigées.")
     return df
 
 
-# ==========================================
-# 3️⃣ Main Preprocessing Function
-# ==========================================
+# ─────────────────────────────────────────────
+# 2. IMPUTATION DES VALEURS MANQUANTES
+# ─────────────────────────────────────────────
 
-def preprocess_data(filepath):
+def impute_numerical(df: pd.DataFrame, strategy: str = 'median') -> pd.DataFrame:
+    """
+    Impute les colonnes numériques manquantes.
+    strategy : 'mean', 'median', ou 'knn'
+    ATTENTION : à appliquer UNIQUEMENT sur X_train puis transformer X_test
+    """
+    num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    missing_cols = [c for c in num_cols if df[c].isnull().any()]
 
-    # Load dataset
-    df = pd.read_csv(filepath)
+    if not missing_cols:
+        print("✅ Aucune valeur manquante numérique.")
+        return df, None
 
-    # --------------------------------------
-    # Drop useless columns
-    # --------------------------------------
-    drop_cols = [
-        "CustomerID",
-        "NewsletterSubscribed",
-        "LastLoginIP"
-    ]
+    df = df.copy()
 
-    for col in drop_cols:
-        if col in df.columns:
-            df.drop(columns=[col], inplace=True)
+    if strategy == 'knn':
+        imputer = KNNImputer(n_neighbors=5)
+    else:
+        imputer = SimpleImputer(strategy=strategy)
 
-    # --------------------------------------
-    # Parse dates
-    # --------------------------------------
-    df = parse_dates(df)
+    df[missing_cols] = imputer.fit_transform(df[missing_cols])
+    print(f"✅ Imputation ({strategy}) sur : {missing_cols}")
+    return df, imputer
 
-    # --------------------------------------
-    # Target
-    # --------------------------------------
-    y = df["Churn"]
-    X = df.drop(columns=["Churn"])
 
-    # --------------------------------------
-    # Train Test Split
-    # --------------------------------------
+def impute_categorical(df: pd.DataFrame) -> pd.DataFrame:
+    """Impute les colonnes catégorielles manquantes par 'Inconnu'."""
+    df = df.copy()
+    cat_cols = df.select_dtypes(include=['object']).columns.tolist()
+    for col in cat_cols:
+        if df[col].isnull().any():
+            df[col] = df[col].fillna('Inconnu')
+    print("✅ Imputation catégorielle par 'Inconnu' effectuée.")
+    return df
+
+
+# ─────────────────────────────────────────────
+# 3. ENCODAGE DES VARIABLES CATÉGORIELLES
+# ─────────────────────────────────────────────
+
+# Définition des ordres pour les variables ordinales
+ORDINAL_MAPPINGS = {
+    'AgeCategory':       ['18-24', '25-34', '35-44', '45-54', '55-64', '65+', 'Inconnu'],
+    'SpendingCategory':  ['Low', 'Medium', 'High', 'VIP'],
+    'LoyaltyLevel':      ['Nouveau', 'Jeune', 'Établi', 'Ancien', 'Inconnu'],
+    'ChurnRiskCategory': ['Faible', 'Moyen', 'Élevé', 'Critique'],
+    'BasketSizeCategory':['Petit', 'Moyen', 'Grand', 'Inconnu'],
+    'PreferredTimeOfDay':['Matin', 'Midi', 'Après-midi', 'Soir', 'Nuit'],
+}
+
+# Variables one-hot
+ONE_HOT_COLS = [
+    'CustomerType', 'FavoriteSeason', 'Region',
+    'WeekendPreference', 'ProductDiversity', 'Gender',
+    'AccountStatus', 'RFMSegment',
+]
+
+
+def encode_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Encode toutes les variables catégorielles :
+    - Ordinales : OrdinalEncoder avec ordre défini
+    - Nominales : pd.get_dummies (One-Hot)
+    - Country   : Target Encoding (remplacé par fréquence ici pour simplicité)
+    """
+    df = df.copy()
+
+    # --- Encodage ordinal ---
+    for col, categories in ORDINAL_MAPPINGS.items():
+        if col not in df.columns:
+            continue
+        # Mapper les valeurs inconnues sur la dernière catégorie
+        df[col] = df[col].apply(lambda x: x if x in categories else categories[-1])
+        mapping = {cat: i for i, cat in enumerate(categories)}
+        df[col] = df[col].map(mapping)
+
+    # --- One-Hot Encoding ---
+    existing_ohe = [c for c in ONE_HOT_COLS if c in df.columns]
+    df = pd.get_dummies(df, columns=existing_ohe, drop_first=False, dtype=int)
+
+    # --- Country : encodage par fréquence ---
+    if 'Country' in df.columns:
+        freq = df['Country'].value_counts(normalize=True)
+        df['Country_FreqEnc'] = df['Country'].map(freq)
+        df = df.drop(columns=['Country'])
+
+    print(f"✅ Encodage terminé. Dimensions : {df.shape}")
+    return df
+
+
+# ─────────────────────────────────────────────
+# 4. SUPPRESSION DE LA MULTICOLINÉARITÉ
+# ─────────────────────────────────────────────
+
+def remove_high_correlation(df: pd.DataFrame, target: str = 'Churn',
+                             threshold: float = 0.85) -> pd.DataFrame:
+    """
+    Supprime les features trop corrélées entre elles (|r| > threshold).
+    Garde toujours la target.
+    """
+    df = df.copy()
+    num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    num_cols = [c for c in num_cols if c != target]
+
+    corr_matrix = df[num_cols].corr().abs()
+    upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+    to_drop = [col for col in upper.columns if any(upper[col] > threshold)]
+
+    df = df.drop(columns=to_drop)
+    print(f"✅ Features supprimées (corrélation > {threshold}) : {to_drop}")
+    return df
+
+
+# ─────────────────────────────────────────────
+# 5. NORMALISATION
+# ─────────────────────────────────────────────
+
+def scale_features(X_train: pd.DataFrame, X_test: pd.DataFrame):
+    """
+    Applique StandardScaler sur X_train, puis transforme X_test.
+    NE PAS normaliser la target (y).
+    Retourne X_train_scaled, X_test_scaled, scaler
+    """
+    scaler = StandardScaler()
+    X_train_scaled = pd.DataFrame(
+        scaler.fit_transform(X_train),
+        columns=X_train.columns,
+        index=X_train.index
+    )
+    X_test_scaled = pd.DataFrame(
+        scaler.transform(X_test),
+        columns=X_test.columns,
+        index=X_test.index
+    )
+    print("✅ Normalisation StandardScaler appliquée.")
+    return X_train_scaled, X_test_scaled, scaler
+
+
+# ─────────────────────────────────────────────
+# 6. SPLIT TRAIN / TEST
+# ─────────────────────────────────────────────
+
+def split_and_save(df: pd.DataFrame, target: str = 'Churn',
+                   test_size: float = 0.2, save_dir: str = 'data/train_test'):
+    """
+    Sépare en train/test (stratifié) et sauvegarde les fichiers CSV.
+    """
+    X = df.drop(columns=[target])
+    y = df[target]
+
     X_train, X_test, y_train, y_test = train_test_split(
         X, y,
-        test_size=0.2,
+        test_size=test_size,
         random_state=42,
         stratify=y
     )
 
-    # --------------------------------------
-    # Identify feature types
-    # --------------------------------------
-    numeric_features = X_train.select_dtypes(
-        include=["int64", "float64"]
-    ).columns.tolist()
+    os.makedirs(save_dir, exist_ok=True)
+    X_train.to_csv(f'{save_dir}/X_train.csv', index=False)
+    X_test.to_csv(f'{save_dir}/X_test.csv',  index=False)
+    y_train.to_csv(f'{save_dir}/y_train.csv', index=False)
+    y_test.to_csv(f'{save_dir}/y_test.csv',  index=False)
 
-    categorical_features = X_train.select_dtypes(
-        include=["object"]
-    ).columns.tolist()
-
-    # --------------------------------------
-    # Numeric pipeline
-    # --------------------------------------
-    numeric_pipeline = Pipeline([
-        ("imputer", SimpleImputer(strategy="median")),
-        ("scaler", StandardScaler())
-    ])
-
-    # --------------------------------------
-    # Categorical pipeline
-    # --------------------------------------
-    categorical_pipeline = Pipeline([
-        ("imputer", SimpleImputer(strategy="most_frequent")),
-        ("onehot", OneHotEncoder(handle_unknown="ignore"))
-    ])
-
-    # --------------------------------------
-    # Column Transformer
-    # --------------------------------------
-    preprocessor = ColumnTransformer([
-        ("num", numeric_pipeline, numeric_features),
-        ("cat", categorical_pipeline, categorical_features)
-    ])
-
-    # --------------------------------------
-    # Full pipeline with feature engineering
-    # --------------------------------------
-    full_pipeline = Pipeline([
-        ("outlier_handler", OutlierHandler()),
-        ("feature_engineering", FeatureEngineering()),
-        ("preprocessor", preprocessor)
-    ])
-
-    # --------------------------------------
-    # Fit ONLY on training data
-    # --------------------------------------
-    X_train_processed = full_pipeline.fit_transform(X_train)
-    X_test_processed = full_pipeline.transform(X_test)
-
-    # --------------------------------------
-    # Get feature names after transformation
-    # --------------------------------------
-    feature_names = (
-        numeric_features + 
-        list(full_pipeline.named_steps["preprocessor"]
-             .named_transformers_["cat"]
-             .named_steps["onehot"]
-             .get_feature_names_out(categorical_features))
-    )
-
-    # --------------------------------------
-    # Save processed data
-    # --------------------------------------
-    import os
-    os.makedirs("data/train_test", exist_ok=True)
-    os.makedirs("data/processed", exist_ok=True)
-    os.makedirs("models", exist_ok=True)
-    
-    # Save train/test splits
-    pd.DataFrame(X_train_processed, columns=feature_names).to_csv(
-        "data/train_test/X_train.csv", index=False
-    )
-    pd.DataFrame(X_test_processed, columns=feature_names).to_csv(
-        "data/train_test/X_test.csv", index=False
-    )
-    y_train.to_csv("data/train_test/y_train.csv", index=False)
-    y_test.to_csv("data/train_test/y_test.csv", index=False)
-    
-    # Save full processed dataset to data/processed/
-    X_full = np.vstack([X_train_processed, X_test_processed])
-    y_full = np.concatenate([y_train.values, y_test.values])
-    
-    processed_df = pd.DataFrame(X_full, columns=feature_names)
-    processed_df["Churn"] = y_full
-    processed_df.to_csv("data/processed/retail_customers_processed.csv", index=False)
-    
-    # Save pipeline
-    joblib.dump(full_pipeline, "models/preprocessing_pipeline.pkl")
-
-    print("✅ Preprocessing completed successfully.")
-    print(f"Train shape: {X_train_processed.shape}")
-    print(f"Test shape: {X_test_processed.shape}")
-    print(f"\n📁 Files saved:")
-    print("   - data/processed/retail_customers_processed.csv (full dataset)")
-    print("   - data/train_test/X_train.csv")
-    print("   - data/train_test/X_test.csv")
-    print("   - data/train_test/y_train.csv")
-    print("   - data/train_test/y_test.csv")
-    print("   - models/preprocessing_pipeline.pkl")
-
-    return X_train_processed, X_test_processed, y_train, y_test, feature_names
+    print(f"✅ Split effectué : train={len(X_train)}, test={len(X_test)}")
+    print(f"   Distribution churn train : {y_train.value_counts().to_dict()}")
+    return X_train, X_test, y_train, y_test
 
 
-# ==========================================
-# Run directly
-# ==========================================
+# ─────────────────────────────────────────────
+# 7. PIPELINE COMPLET DE PRÉTRAITEMENT
+# ─────────────────────────────────────────────
 
-if __name__ == "__main__":
-    preprocess_data("data/raw/retail_customers_COMPLETE_CATEGORICAL.csv")
+def full_preprocessing_pipeline(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Exécute toutes les étapes de prétraitement dans l'ordre correct.
+    """
+    print("\n" + "="*60)
+    print("🔧 PIPELINE DE PRÉTRAITEMENT")
+    print("="*60)
+
+    df = clean_outliers(df)
+    df = impute_categorical(df)
+    df, _ = impute_numerical(df, strategy='median')
+    df = encode_features(df)
+    df = remove_high_correlation(df, target='Churn')
+
+    print(f"\n✅ Prétraitement terminé. Shape final : {df.shape}")
+    return df
