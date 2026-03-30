@@ -5,17 +5,18 @@ app/app.py - Interface Flask pour prédire le churn d'un client
 from flask import Flask, request, jsonify, render_template_string
 import joblib
 import pandas as pd
-import numpy as np
-import sys
 import os
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from pathlib import Path
 
 app = Flask(__name__)
 
+BASE_DIR = Path(__file__).resolve().parents[1]
+MODELS_DIR = BASE_DIR / 'models'
+
 # ─── Chargement des modèles ───────────────────
 try:
-    rf     = joblib.load('models/random_forest.pkl')
-    scaler = joblib.load('models/scaler.pkl')
+    rf = joblib.load(MODELS_DIR / 'random_forest.pkl')
+    scaler = joblib.load(MODELS_DIR / 'scaler.pkl')
     MODELS_LOADED = True
     print("✅ Modèles chargés.")
 except Exception as e:
@@ -122,12 +123,19 @@ def predict():
     if not MODELS_LOADED:
         return jsonify({"error": "Modèles non chargés. Entraîner d'abord le modèle."})
 
-    data = request.get_json()
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Payload JSON invalide."}), 400
+
     try:
-        # Construire un DataFrame avec les features reçues
-        # Remplir les colonnes manquantes avec des valeurs par défaut (0 ou médiane)
-        expected_features = rf.feature_names_in_
-        row = {col: 0 for col in expected_features}
+        expected_features = list(getattr(rf, 'feature_names_in_', []))
+        if not expected_features and scaler is not None:
+            expected_features = list(getattr(scaler, 'feature_names_in_', []))
+
+        if not expected_features:
+            return jsonify({"error": "Impossible de récupérer les colonnes attendues du modèle."}), 500
+
+        row = {col: 0.0 for col in expected_features}
 
         # Mapper les champs du formulaire
         mapping = {
@@ -140,15 +148,25 @@ def predict():
             'CustomerTenureDays':  'CustomerTenureDays',
         }
         for key, col in mapping.items():
-            if key in data and col in row:
-                row[col] = data[key]
+            if key in data:
+                try:
+                    value = float(data[key])
+                except (TypeError, ValueError):
+                    return jsonify({"error": f"Valeur invalide pour '{key}'."}), 400
 
-        df = pd.DataFrame([row])
-        X_scaled = scaler.transform(df)
+                if col in row:
+                    row[col] = value
 
-        pred  = rf.predict(X_scaled)[0]
-        proba = rf.predict_proba(X_scaled)[0][1]
-        risk  = "Élevé" if proba > 0.7 else "Moyen" if proba > 0.4 else "Faible"
+        df = pd.DataFrame([row], columns=expected_features)
+        X_input = scaler.transform(df) if scaler is not None else df
+
+        # Conserver les noms de colonnes évite les warnings sklearn sur feature_names.
+        if not isinstance(X_input, pd.DataFrame):
+            X_input = pd.DataFrame(X_input, columns=expected_features)
+
+        pred = rf.predict(X_input)[0]
+        proba = rf.predict_proba(X_input)[0][1]
+        risk = "Élevé" if proba > 0.7 else "Moyen" if proba > 0.4 else "Faible"
 
         return jsonify({
             "churn_prediction":  int(pred),
@@ -165,5 +183,11 @@ def health():
     return jsonify({"status": "ok", "models_loaded": MODELS_LOADED})
 
 
+@app.route('/favicon.ico')
+def favicon():
+    return '', 204
+
+
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    debug_mode = os.getenv('FLASK_DEBUG', '1') == '1'
+    app.run(debug=debug_mode, host='0.0.0.0', port=5000)
