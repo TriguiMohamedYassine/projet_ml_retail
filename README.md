@@ -1,6 +1,6 @@
 # 🛍️ Projet ML — Analyse Comportementale Clientèle Retail
 
-Atelier Machine Learning — GI2 | Préparé par Fadoua Drira | 2025-2026
+Atelier Machine Learning — GI2 
 
 ## 📋 Description
 Pipeline complet de Machine Learning sur une base de données e-commerce (4372 clients, 52 features).
